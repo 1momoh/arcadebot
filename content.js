@@ -1,28 +1,22 @@
 /* =========================================================
-   ArcadeBot — Content Script
-   Strategy:
-   1. Grab the game canvas → read pixel data each frame
-   2. Find red-glowing enemy pixels (high R, low G/B)
-   3. Cluster them into enemy objects
-   4. Move player toward the lowest/nearest threat
-   5. Spam Space to shoot continuously
+   ArcadeBot — Content Script v1.1
+   Fix: broadcast key events to window + document + body + canvas
+        AND re-fire keydown every frame while moving (key-repeat)
    ========================================================= */
 
 (function () {
   'use strict';
 
   /* ── State ─────────────────────────────────────────── */
-  let botActive   = false;
-  let rafId       = null;
-  let playerX     = null;   // estimated player X on canvas
-  let frameCount  = 0;
-  let killCount   = 0;
-  let lastEnemyCount = 0;
+  let botActive  = false;
+  let rafId      = null;
+  let playerX    = null;
+  let frameCount = 0;
 
-  const keysHeld = { left: false, right: false };
-  let   shootInterval = null;
+  const moving = { left: false, right: false };
+  let shootInterval = null;
 
-  /* ── Overlay HUD ──────────────────────────────────── */
+  /* ── HUD ──────────────────────────────────────────── */
   let hud = null;
 
   function createHUD() {
@@ -30,26 +24,15 @@
     hud = document.createElement('div');
     hud.id = '__arcadebot_hud__';
     Object.assign(hud.style, {
-      position:   'fixed',
-      top:        '12px',
-      right:      '12px',
-      zIndex:     '999999',
-      background: 'rgba(0,0,0,0.85)',
-      border:     '1px solid #00ff88',
-      borderRadius: '6px',
-      padding:    '8px 14px',
-      fontFamily: '"Courier New", monospace',
-      fontSize:   '11px',
-      color:      '#00ff88',
-      lineHeight: '1.7',
-      pointerEvents: 'none',
-      boxShadow:  '0 0 12px rgba(0,255,136,0.3)',
-      minWidth:   '160px',
+      position: 'fixed', top: '12px', right: '12px', zIndex: '999999',
+      background: 'rgba(0,0,0,0.85)', border: '1px solid #00ff88',
+      borderRadius: '6px', padding: '8px 14px',
+      fontFamily: '"Courier New", monospace', fontSize: '11px',
+      color: '#00ff88', lineHeight: '1.7', pointerEvents: 'none',
+      boxShadow: '0 0 12px rgba(0,255,136,0.3)', minWidth: '160px',
     });
     hud.innerHTML = `
-      <div style="font-size:13px;font-weight:bold;letter-spacing:2px;margin-bottom:4px;">
-        🤖 ARCADEBOT
-      </div>
+      <div style="font-size:13px;font-weight:bold;letter-spacing:2px;margin-bottom:4px;">🤖 ARCADEBOT</div>
       <div id="__bot_status__">● ACTIVE</div>
       <div id="__bot_enemies__">ENEMIES: 0</div>
       <div id="__bot_frame__">FRAME: 0</div>
@@ -58,9 +41,7 @@
     document.body.appendChild(hud);
   }
 
-  function removeHUD() {
-    if (hud) { hud.remove(); hud = null; }
-  }
+  function removeHUD() { if (hud) { hud.remove(); hud = null; } }
 
   function updateHUD(enemies, dir) {
     if (!hud) return;
@@ -70,95 +51,107 @@
     document.getElementById('__bot_dir__').textContent     = `DIR: ${dir}`;
   }
 
-  /* ── Key helpers ──────────────────────────────────── */
-  function fireKey(type, key, code) {
-    const el = getGameTarget();
-    el.dispatchEvent(new KeyboardEvent(type, {
-      key, code, keyCode: key === ' ' ? 32 : key === 'a' ? 65 : 68,
-      which: key === ' ' ? 32 : key === 'a' ? 65 : 68,
-      bubbles: true, cancelable: true
-    }));
+  /* ── Key broadcast — fires to EVERY possible listener ── */
+  function broadcastKey(type, key, code, keyCode) {
+    const makeEvt = () => new KeyboardEvent(type, {
+      key, code, keyCode, which: keyCode,
+      bubbles: true, cancelable: true,
+      composed: true,  // crosses shadow DOM
+    });
+
+    // Cover all common game event targets
+    window.dispatchEvent(makeEvt());
+    document.dispatchEvent(makeEvt());
+    document.body.dispatchEvent(makeEvt());
+
+    const canvas = getCanvas();
+    if (canvas) canvas.dispatchEvent(makeEvt());
+
+    // Also any focused element
+    const active = document.activeElement;
+    if (active && active !== document.body) active.dispatchEvent(makeEvt());
   }
 
-  function holdLeft()    { if (!keysHeld.left)  { keysHeld.left  = true;  fireKey('keydown','a','KeyA'); } }
-  function holdRight()   { if (!keysHeld.right) { keysHeld.right = true;  fireKey('keydown','d','KeyD'); } }
-  function releaseLeft() { if (keysHeld.left)   { keysHeld.left  = false; fireKey('keyup','a','KeyA');   } }
-  function releaseRight(){ if (keysHeld.right)  { keysHeld.right = false; fireKey('keyup','d','KeyD');   } }
-  function releaseAll()  { releaseLeft(); releaseRight(); }
+  function pressKey(key, code, keyCode)   { broadcastKey('keydown', key, code, keyCode); }
+  function releaseKey(key, code, keyCode) { broadcastKey('keyup',   key, code, keyCode); }
 
+  /* ── Movement — re-fires keydown EVERY frame (simulates key-hold) ── */
+  function moveLeft() {
+    if (moving.right) { releaseKey('d', 'KeyD', 68); moving.right = false; }
+    moving.left = true;
+    pressKey('a', 'KeyA', 65);
+  }
+
+  function moveRight() {
+    if (moving.left) { releaseKey('a', 'KeyA', 65); moving.left = false; }
+    moving.right = true;
+    pressKey('d', 'KeyD', 68);
+  }
+
+  function stopMoving() {
+    if (moving.left)  { releaseKey('a', 'KeyA', 65); moving.left  = false; }
+    if (moving.right) { releaseKey('d', 'KeyD', 68); moving.right = false; }
+  }
+
+  /* ── Shooting ─────────────────────────────────────── */
   function startShooting() {
     if (shootInterval) return;
-    // Press space every 80ms — fast enough to saturate most shooters
     shootInterval = setInterval(() => {
-      fireKey('keydown', ' ', 'Space');
-      setTimeout(() => fireKey('keyup', ' ', 'Space'), 40);
-    }, 80);
+      pressKey(' ', 'Space', 32);
+      setTimeout(() => releaseKey(' ', 'Space', 32), 50);
+    }, 100);
   }
 
   function stopShooting() {
     if (shootInterval) { clearInterval(shootInterval); shootInterval = null; }
-    fireKey('keyup', ' ', 'Space');
+    releaseKey(' ', 'Space', 32);
   }
 
-  /* ── Find game target element for events ─────────── */
-  function getGameTarget() {
-    return document.querySelector('canvas') || document.body;
-  }
-
-  /* ── Canvas detection ─────────────────────────────── */
+  /* ── Canvas ───────────────────────────────────────── */
   function getCanvas() {
-    // Prefer canvas with the largest area (the game canvas)
-    const canvases = Array.from(document.querySelectorAll('canvas'));
-    if (!canvases.length) return null;
-    return canvases.reduce((a, b) => (a.width * a.height >= b.width * b.height ? a : b));
+    const all = Array.from(document.querySelectorAll('canvas'));
+    if (!all.length) return null;
+    return all.reduce((a, b) => (a.width * a.height >= b.width * b.height ? a : b));
   }
 
-  /* ── Pixel analysis — find red enemies ───────────── */
+  /* ── Pixel scan — find red enemies ───────────────── */
   function findEnemies(canvas) {
     let ctx;
-    try {
-      ctx = canvas.getContext('2d');
-      if (!ctx) return [];
-    } catch(e) { return []; }
+    try { ctx = canvas.getContext('2d'); if (!ctx) return []; }
+    catch (e) { return []; }
 
-    const W = canvas.width;
-    const H = canvas.height;
+    const W = canvas.width, H = canvas.height;
     if (!W || !H) return [];
 
     let imageData;
-    try {
-      imageData = ctx.getImageData(0, 0, W, H);
-    } catch(e) {
-      // Tainted canvas (cross-origin) — fall back to center-shoot mode
-      return null;
-    }
+    try { imageData = ctx.getImageData(0, 0, W, H); }
+    catch (e) { return null; } // tainted canvas
 
     const data = imageData.data;
     const raw  = [];
-    const STEP = 3; // sample every 3px for speed
-
-    // Scan top 85% of canvas — player is at bottom
-    const scanH = Math.floor(H * 0.85);
+    const STEP = 3;
+    const scanH = Math.floor(H * 0.88);
 
     for (let y = 0; y < scanH; y += STEP) {
       for (let x = 0; x < W; x += STEP) {
         const i = (y * W + x) * 4;
-        const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
-        // Enemy pixels: saturated red, dark green/blue, visible alpha
-        if (a > 80 && r > 140 && g < 70 && b < 70) {
+        const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+        // Red enemy pixels: high R, low G/B
+        if (a > 80 && r > 130 && g < 80 && b < 80) {
           raw.push({ x, y });
         }
       }
     }
 
-    return clusterPoints(raw, 25);
+    return cluster(raw, 28);
   }
 
-  /* ── DBSCAN-lite clustering ───────────────────────── */
-  function clusterPoints(points, radius) {
+  /* ── Clustering ───────────────────────────────────── */
+  function cluster(points, radius) {
     if (!points.length) return [];
-    const used    = new Uint8Array(points.length);
+    const used     = new Uint8Array(points.length);
     const clusters = [];
+    const r2       = radius * radius;
 
     for (let i = 0; i < points.length; i++) {
       if (used[i]) continue;
@@ -168,51 +161,42 @@
         if (used[j]) continue;
         const dx = points[i].x - points[j].x;
         const dy = points[i].y - points[j].y;
-        if (dx*dx + dy*dy < radius*radius) { members.push(j); used[j] = 1; }
+        if (dx * dx + dy * dy < r2) { members.push(j); used[j] = 1; }
       }
-      if (members.length >= 1) {
-        const cx = members.reduce((s,k) => s + points[k].x, 0) / members.length;
-        const cy = members.reduce((s,k) => s + points[k].y, 0) / members.length;
-        clusters.push({ x: cx, y: cy, size: members.length });
-      }
+      const cx = members.reduce((s, k) => s + points[k].x, 0) / members.length;
+      const cy = members.reduce((s, k) => s + points[k].y, 0) / members.length;
+      clusters.push({ x: cx, y: cy, size: members.length });
     }
     return clusters;
   }
 
-  /* ── Pick best target ─────────────────────────────── */
+  /* ── Pick target — lowest + closest to player ────── */
   function pickTarget(enemies, canvasW) {
     if (!enemies || !enemies.length) return null;
-
-    // Priority 1: lowest enemy (most urgent threat)
-    // Priority 2: among equally low enemies, closest to player center
     const cx = playerX !== null ? playerX : canvasW / 2;
-
     return enemies.reduce((best, e) => {
       if (!best) return e;
-      // Weight: lower Y wins strongly, ties broken by proximity
-      const bestScore = best.y * 10 - Math.abs(best.x - cx);
-      const eScore    = e.y    * 10 - Math.abs(e.x    - cx);
-      return eScore > bestScore ? e : best;
+      const bs = best.y * 10 - Math.abs(best.x - cx);
+      const es = e.y    * 10 - Math.abs(e.x    - cx);
+      return es > bs ? e : best;
     }, null);
   }
 
-  /* ── Estimate player X from movement history ──────── */
+  /* ── Track player position estimate ──────────────── */
   function updatePlayerX(canvas) {
     if (playerX === null) playerX = canvas.width / 2;
-    // Nudge tracked position based on held keys (approx 2px/frame)
-    if (keysHeld.left)  playerX = Math.max(0,             playerX - 2);
-    if (keysHeld.right) playerX = Math.min(canvas.width,  playerX + 2);
+    if (moving.left)  playerX = Math.max(0,            playerX - 3);
+    if (moving.right) playerX = Math.min(canvas.width, playerX + 3);
   }
 
-  /* ── Bot main loop ────────────────────────────────── */
+  /* ── Main loop ────────────────────────────────────── */
   function botLoop() {
     if (!botActive) return;
     frameCount++;
 
     const canvas = getCanvas();
-
     if (!canvas) {
-      updateHUD(0, 'NO CVS');
+      updateHUD(0, 'NO CANVAS');
       rafId = requestAnimationFrame(botLoop);
       return;
     }
@@ -221,9 +205,12 @@
 
     const enemies = findEnemies(canvas);
 
-    /* Tainted canvas fallback — just shoot toward center */
+    // Tainted canvas — can't read pixels, oscillate and shoot
     if (enemies === null) {
-      updateHUD('?', 'CORS');
+      const period = 90;
+      const phase  = Math.floor(frameCount / period) % 2;
+      if (phase === 0) moveLeft(); else moveRight();
+      updateHUD('?', 'CORS-OSC');
       rafId = requestAnimationFrame(botLoop);
       return;
     }
@@ -232,22 +219,22 @@
     let dir = '─';
 
     if (target) {
-      const DEAD_ZONE = 12;
+      const DEAD_ZONE = 8;
       const diff = target.x - playerX;
 
       if (diff > DEAD_ZONE) {
-        holdRight(); releaseLeft();
-        dir = '→';
+        moveRight();
+        dir = `→ (${Math.round(diff)}px)`;
       } else if (diff < -DEAD_ZONE) {
-        holdLeft(); releaseRight();
-        dir = '←';
+        moveLeft();
+        dir = `← (${Math.round(Math.abs(diff))}px)`;
       } else {
-        releaseAll();
-        dir = '●';
+        stopMoving();
+        dir = '● LOCKED';
       }
     } else {
-      // No enemies visible — idle, stay still
-      releaseAll();
+      stopMoving();
+      dir = 'SCANNING';
     }
 
     updateHUD(enemies.length, dir);
@@ -257,13 +244,13 @@
   /* ── Start / Stop ─────────────────────────────────── */
   function startBot() {
     if (botActive) return;
-    botActive = true;
-    playerX   = null;
+    botActive  = true;
+    playerX    = null;
     frameCount = 0;
     createHUD();
     startShooting();
     botLoop();
-    console.log('[ArcadeBot] ▶ Started');
+    console.log('[ArcadeBot] ▶ Started v1.1');
   }
 
   function stopBot() {
@@ -271,17 +258,17 @@
     cancelAnimationFrame(rafId);
     rafId = null;
     stopShooting();
-    releaseAll();
+    stopMoving();
     removeHUD();
     console.log('[ArcadeBot] ■ Stopped');
   }
 
-  /* ── Message bridge from popup ────────────────────── */
+  /* ── Message bridge ───────────────────────────────── */
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.action === 'start') { startBot();  sendResponse({ ok: true, active: true  }); }
-    if (msg.action === 'stop')  { stopBot();   sendResponse({ ok: true, active: false }); }
-    if (msg.action === 'status'){ sendResponse({ ok: true, active: botActive }); }
+    if (msg.action === 'start')  { startBot(); sendResponse({ ok: true, active: true  }); }
+    if (msg.action === 'stop')   { stopBot();  sendResponse({ ok: true, active: false }); }
+    if (msg.action === 'status') { sendResponse({ ok: true, active: botActive }); }
   });
 
-  console.log('[ArcadeBot] Content script loaded — open the extension popup to activate.');
+  console.log('[ArcadeBot] v1.1 loaded — open popup to activate.');
 })();
