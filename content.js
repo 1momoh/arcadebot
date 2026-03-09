@@ -1,12 +1,10 @@
 /* =========================================================
-   ArcadeBot — Content Script v1.2
-   Fixes:
-   - Watchdog timer restarts loop if rAF stalls (tab blur etc)
-   - try/catch on every frame so errors can't kill the loop
-   - setInterval heartbeat as backup to requestAnimationFrame
-   - 3x faster shooting (40ms interval)
-   - Ultra-fast movement: fires keydown 4x per frame + tiny dead zone
-   - Teleport-style movement: bursts of rapid key events
+   ArcadeBot — Content Script v1.3
+   - ONE loop only (rAF) — no dual-loop conflict
+   - Watchdog revives if rAF stalls (tab blur, GC, errors)
+   - Fast shoot: 40ms interval (~25/sec)
+   - Fast movement: burst keydowns per frame, tight dead zone
+   - Every frame wrapped in try/catch — loop never dies
    ========================================================= */
 
 (function () {
@@ -15,9 +13,8 @@
   /* ── State ─────────────────────────────────────────── */
   let botActive  = false;
   let rafId      = null;
-  let heartbeat  = null;   // backup interval if rAF stalls
-  let watchdog   = null;   // detects if loop froze
-  let lastFrame  = 0;      // timestamp of last successful frame
+  let watchdog   = null;
+  let lastTick   = 0;
   let playerX    = null;
   let frameCount = 0;
 
@@ -45,53 +42,64 @@
       <div id="__bot_enemies__">ENEMIES: 0</div>
       <div id="__bot_frame__">FRAME: 0</div>
       <div id="__bot_dir__">DIR: ─</div>
-      <div id="__bot_wd__" style="color:#ff3366;font-size:9px;"></div>
+      <div id="__bot_wd__" style="color:#ff3366;font-size:9px;min-height:12px;"></div>
     `;
     document.body.appendChild(hud);
   }
 
   function removeHUD() { if (hud) { hud.remove(); hud = null; } }
 
-  function updateHUD(enemies, dir, wdMsg) {
+  function updateHUD(enemies, dir, note) {
     if (!hud) return;
     try {
       document.getElementById('__bot_status__').textContent  = '● ACTIVE';
       document.getElementById('__bot_enemies__').textContent = `ENEMIES: ${enemies}`;
       document.getElementById('__bot_frame__').textContent   = `FRAME: ${frameCount}`;
       document.getElementById('__bot_dir__').textContent     = `DIR: ${dir}`;
-      document.getElementById('__bot_wd__').textContent      = wdMsg || '';
-    } catch(e) {}
+      document.getElementById('__bot_wd__').textContent      = note || '';
+    } catch (e) {}
   }
 
-  /* ── Key broadcast ────────────────────────────────── */
+  /* ── Key broadcast — all possible targets ─────────── */
   function broadcastKey(type, key, code, keyCode) {
     const makeEvt = () => new KeyboardEvent(type, {
       key, code, keyCode, which: keyCode,
       bubbles: true, cancelable: true, composed: true,
     });
-    try { window.dispatchEvent(makeEvt()); }   catch(e) {}
-    try { document.dispatchEvent(makeEvt()); } catch(e) {}
-    try { document.body.dispatchEvent(makeEvt()); } catch(e) {}
-    const canvas = getCanvas();
-    if (canvas) try { canvas.dispatchEvent(makeEvt()); } catch(e) {}
-    const active = document.activeElement;
-    if (active && active !== document.body) try { active.dispatchEvent(makeEvt()); } catch(e) {}
+    try { window.dispatchEvent(makeEvt()); }        catch (e) {}
+    try { document.dispatchEvent(makeEvt()); }      catch (e) {}
+    try { document.body.dispatchEvent(makeEvt()); } catch (e) {}
+    const cvs = getCanvas();
+    if (cvs) try { cvs.dispatchEvent(makeEvt()); } catch (e) {}
+    const focused = document.activeElement;
+    if (focused && focused !== document.body) {
+      try { focused.dispatchEvent(makeEvt()); } catch (e) {}
+    }
   }
 
   function pressKey(key, code, kc)   { broadcastKey('keydown', key, code, kc); }
   function releaseKey(key, code, kc) { broadcastKey('keyup',   key, code, kc); }
 
-  /* ── Ultra-fast movement — fires keydown N times per call ── */
-  const BURST = 5; // keydown events per frame — feels like teleporting
+  /* ── Movement ─────────────────────────────────────── */
+  // Fires a burst of keydowns per call for snappy response
+  const BURST = 4;
 
   function moveLeft() {
-    if (moving.right) { releaseKey('d', 'KeyD', 68); moving.right = false; }
+    // Release right first if it was held
+    if (moving.right) {
+      releaseKey('d', 'KeyD', 68);
+      moving.right = false;
+    }
     moving.left = true;
     for (let i = 0; i < BURST; i++) pressKey('a', 'KeyA', 65);
   }
 
   function moveRight() {
-    if (moving.left) { releaseKey('a', 'KeyA', 65); moving.left = false; }
+    // Release left first if it was held
+    if (moving.left) {
+      releaseKey('a', 'KeyA', 65);
+      moving.left = false;
+    }
     moving.right = true;
     for (let i = 0; i < BURST; i++) pressKey('d', 'KeyD', 68);
   }
@@ -101,18 +109,18 @@
     if (moving.right) { releaseKey('d', 'KeyD', 68); moving.right = false; }
   }
 
-  /* ── Ultra-fast shooting ──────────────────────────── */
+  /* ── Shooting — independent interval, not in loop ── */
   function startShooting() {
     if (shootInterval) return;
     shootInterval = setInterval(() => {
       pressKey(' ', 'Space', 32);
       setTimeout(() => releaseKey(' ', 'Space', 32), 20);
-    }, 40); // fires ~25 shots/sec
+    }, 40);
   }
 
   function stopShooting() {
     if (shootInterval) { clearInterval(shootInterval); shootInterval = null; }
-    try { releaseKey(' ', 'Space', 32); } catch(e) {}
+    try { releaseKey(' ', 'Space', 32); } catch (e) {}
   }
 
   /* ── Canvas ───────────────────────────────────────── */
@@ -121,7 +129,7 @@
       const all = Array.from(document.querySelectorAll('canvas'));
       if (!all.length) return null;
       return all.reduce((a, b) => (a.width * a.height >= b.width * b.height ? a : b));
-    } catch(e) { return null; }
+    } catch (e) { return null; }
   }
 
   /* ── Pixel scan ───────────────────────────────────── */
@@ -134,12 +142,12 @@
 
       let imageData;
       try { imageData = ctx.getImageData(0, 0, W, H); }
-      catch (e) { return null; } // tainted
+      catch (e) { return null; } // tainted canvas
 
-      const data   = imageData.data;
-      const raw    = [];
-      const STEP   = 3;
-      const scanH  = Math.floor(H * 0.88);
+      const data  = imageData.data;
+      const raw   = [];
+      const STEP  = 3;
+      const scanH = Math.floor(H * 0.88);
 
       for (let y = 0; y < scanH; y += STEP) {
         for (let x = 0; x < W; x += STEP) {
@@ -149,7 +157,7 @@
         }
       }
       return cluster(raw, 28);
-    } catch(e) { return []; }
+    } catch (e) { return []; }
   }
 
   /* ── Clustering ───────────────────────────────────── */
@@ -165,7 +173,7 @@
         if (used[j]) continue;
         const dx = points[i].x - points[j].x;
         const dy = points[i].y - points[j].y;
-        if (dx*dx + dy*dy < r2) { m.push(j); used[j] = 1; }
+        if (dx * dx + dy * dy < r2) { m.push(j); used[j] = 1; }
       }
       const cx = m.reduce((s,k) => s + points[k].x, 0) / m.length;
       const cy = m.reduce((s,k) => s + points[k].y, 0) / m.length;
@@ -174,7 +182,7 @@
     return out;
   }
 
-  /* ── Pick target ──────────────────────────────────── */
+  /* ── Pick best target ─────────────────────────────── */
   function pickTarget(enemies, canvasW) {
     if (!enemies || !enemies.length) return null;
     const cx = playerX !== null ? playerX : canvasW / 2;
@@ -186,31 +194,30 @@
     }, null);
   }
 
-  /* ── Player position estimate ─────────────────────── */
+  /* ── Player X estimate ────────────────────────────── */
   function updatePlayerX(canvas) {
     if (playerX === null) playerX = canvas.width / 2;
-    // Larger nudge to match faster movement
-    if (moving.left)  playerX = Math.max(0,            playerX - 8);
-    if (moving.right) playerX = Math.min(canvas.width, playerX + 8);
+    if (moving.left)  playerX = Math.max(0,            playerX - 6);
+    if (moving.right) playerX = Math.min(canvas.width, playerX + 6);
   }
 
-  /* ── Core frame logic (wrapped in try/catch) ──────── */
+  /* ── Single frame tick ────────────────────────────── */
   function tick() {
     if (!botActive) return;
+    lastTick = Date.now();
+
     try {
       frameCount++;
-      lastFrame = Date.now();
-
       const canvas = getCanvas();
       if (!canvas) { updateHUD(0, 'NO CANVAS'); return; }
 
       updatePlayerX(canvas);
       const enemies = findEnemies(canvas);
 
-      // Tainted canvas fallback — oscillate
       if (enemies === null) {
-        const phase = Math.floor(frameCount / 60) % 2;
-        if (phase === 0) moveLeft(); else moveRight();
+        // Tainted canvas — oscillate left/right
+        if (Math.floor(frameCount / 80) % 2 === 0) moveLeft();
+        else moveRight();
         updateHUD('?', 'CORS-OSC');
         return;
       }
@@ -219,7 +226,7 @@
       let dir = '─';
 
       if (target) {
-        const DEAD_ZONE = 5; // very tight — snaps instantly
+        const DEAD_ZONE = 6;
         const diff = target.x - playerX;
 
         if (diff > DEAD_ZONE) {
@@ -239,47 +246,36 @@
 
       updateHUD(enemies.length, dir);
     } catch (err) {
-      console.warn('[ArcadeBot] frame error (continuing):', err);
+      console.warn('[ArcadeBot] tick error (continuing):', err.message);
     }
   }
 
-  /* ── rAF loop ─────────────────────────────────────── */
+  /* ── rAF loop — the ONE and ONLY driver ───────────── */
   function botLoop() {
     if (!botActive) return;
     tick();
     rafId = requestAnimationFrame(botLoop);
   }
 
-  /* ── Watchdog — detects stalled loop & revives it ─── */
+  /* ── Watchdog — revives stalled rAF ──────────────── */
+  // Checks every 400ms. If lastTick is too old, rAF has stalled
+  // (browser throttled the tab). Cancels old rAF and starts fresh.
   function startWatchdog() {
     watchdog = setInterval(() => {
       if (!botActive) return;
-      const age = Date.now() - lastFrame;
-      if (age > 500) {
-        // Loop stalled (tab blur, GC pause, error) — revive
-        console.warn('[ArcadeBot] Watchdog: loop stalled, restarting...');
+      if (Date.now() - lastTick > 600) {
+        console.warn('[ArcadeBot] Watchdog: rAF stalled — reviving');
         cancelAnimationFrame(rafId);
-        if (hud) {
-          try { document.getElementById('__bot_wd__').textContent = '⚡ REVIVED'; } catch(e){}
-        }
+        try {
+          document.getElementById('__bot_wd__').textContent = '⚡ REVIVED';
+          setTimeout(() => {
+            const el = document.getElementById('__bot_wd__');
+            if (el) el.textContent = '';
+          }, 1000);
+        } catch (e) {}
         rafId = requestAnimationFrame(botLoop);
       }
-    }, 500);
-  }
-
-  /* ── Heartbeat interval — secondary driver ─────────── */
-  // Runs tick() every 16ms independently of rAF.
-  // Ensures movement/shooting continues even when rAF pauses.
-  function startHeartbeat() {
-    if (heartbeat) return;
-    heartbeat = setInterval(() => {
-      if (!botActive) return;
-      tick();
-    }, 16);
-  }
-
-  function stopHeartbeat() {
-    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    }, 400);
   }
 
   function stopWatchdog() {
@@ -292,13 +288,12 @@
     botActive  = true;
     playerX    = null;
     frameCount = 0;
-    lastFrame  = Date.now();
+    lastTick   = Date.now();
     createHUD();
-    startShooting();
-    startHeartbeat();
-    startWatchdog();
-    botLoop();
-    console.log('[ArcadeBot] ▶ Started v1.2');
+    startShooting();   // independent setInterval — won't conflict with rAF
+    startWatchdog();   // revive guard
+    botLoop();         // single rAF loop
+    console.log('[ArcadeBot] ▶ v1.3');
   }
 
   function stopBot() {
@@ -307,7 +302,6 @@
     rafId = null;
     stopShooting();
     stopMoving();
-    stopHeartbeat();
     stopWatchdog();
     removeHUD();
     console.log('[ArcadeBot] ■ Stopped');
@@ -320,5 +314,5 @@
     if (msg.action === 'status') { sendResponse({ ok: true, active: botActive }); }
   });
 
-  console.log('[ArcadeBot] v1.2 loaded.');
+  console.log('[ArcadeBot] v1.3 loaded.');
 })();
